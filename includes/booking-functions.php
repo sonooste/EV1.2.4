@@ -19,7 +19,7 @@ function createBooking($userId, $chargingPointId, $date, $startTime, $endTime) {
         $conn->begin_transaction();
 
         // Check if the charging point is available
-        if (!isTimeSlotAvailable($chargingPointId, $date, $startTime, $endTime)) {
+        if (!checkTimeSlotAvailability($chargingPointId, $date, $startTime, $endTime)) {
             throw new Exception('Selected time slot is not available.');
         }
 
@@ -71,7 +71,7 @@ function createBooking($userId, $chargingPointId, $date, $startTime, $endTime) {
  * @param string $endTime End time (H:i)
  * @return bool True if available, false if not
  */
-function isTimeSlotAvailable($chargingPointId, $date, $startTime, $endTime) {
+function checkTimeSlotAvailability($chargingPointId, $date, $startTime, $endTime) {
     $conn = getDbConnection();
     
     // Check if charging point exists and is operational
@@ -139,7 +139,7 @@ function getAvailableTimeSlots($chargingPointId, $date) {
         $startTime = sprintf("%02d:00", $hour);
         $endTime = sprintf("%02d:00", $hour + 1);
 
-        if (isTimeSlotAvailable($chargingPointId, $date, $startTime, $endTime)) {
+        if (checkTimeSlotAvailability($chargingPointId, $date, $startTime, $endTime)) {
             $timeSlots[] = [
                 'start' => $startTime,
                 'end' => $endTime
