@@ -29,56 +29,21 @@ if (!$stationId || !$chargingPointId || !$date || !$startTime || !$endTime) {
     redirect('bookings.php');
 }
 
-try {
-    // Get database connection
-    $conn = getDbConnection();
+// Validate date and time format
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date) || 
+    !preg_match('/^\d{2}:\d{2}$/', $startTime) || 
+    !preg_match('/^\d{2}:\d{2}$/', $endTime)) {
+    setFlashMessage('error', 'Invalid date or time format.');
+    redirect('bookings.php');
+}
 
-    // Create booking datetime
-    $bookingDatetime = $date . ' ' . $startTime;
+// Create the booking
+$bookingId = createBooking($_SESSION['user_id'], $chargingPointId, $date, $startTime, $endTime);
 
-    // Start transaction
-    $conn->begin_transaction();
-
-    // Check if charging point is available
-    $stmt = $conn->prepare("SELECT charging_point_state FROM Charging_Points WHERE charging_point_id = ?");
-    $stmt->bind_param("i", $chargingPointId);
-    $stmt->execute();
-    $result = $stmt->get_result();
-    $chargingPoint = $result->fetch_assoc();
-
-    if (!$chargingPoint || $chargingPoint['charging_point_state'] !== 'available') {
-        throw new Exception('Charging point is not available.');
-    }
-
-    // Insert booking
-    $stmt = $conn->prepare("INSERT INTO Bookings (booking_datetime, user_id, charging_point_id) VALUES (?, ?, ?)");
-    $stmt->bind_param("sii", $bookingDatetime, $_SESSION['user_id'], $chargingPointId);
-
-    if (!$stmt->execute()) {
-        throw new Exception('Failed to create booking.');
-    }
-
-    // Update charging point status
-    $stmt = $conn->prepare("UPDATE Charging_Points SET charging_point_state = 'reserved' WHERE charging_point_id = ?");
-    $stmt->bind_param("i", $chargingPointId);
-
-    if (!$stmt->execute()) {
-        throw new Exception('Failed to update charging point status.');
-    }
-
-    // Commit transaction
-    $conn->commit();
-
-    setFlashMessage('success', 'Booking created successfully!');
+if ($bookingId) {
+    setFlashMessage('success', 'Booking created successfully! Your charging slot has been reserved.');
     redirect('pages/dashboard.php');
-
-} catch (Exception $e) {
-    // Rollback transaction on error
-    if (isset($conn)) {
-        $conn->rollback();
-    }
-
-    error_log("Booking error: " . $e->getMessage());
-    setFlashMessage('error', 'Failed to create booking. Please try again.');
+} else {
+    setFlashMessage('error', 'Failed to create booking. The selected time slot may no longer be available.');
     redirect('bookings.php?station_id=' . $stationId);
 }

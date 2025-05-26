@@ -8,36 +8,146 @@
  *
  * @param int $userId User ID
  * @param int $chargingPointId Charging point ID
- * @param string $bookingDatetime Booking datetime
+ * @param string $date Booking date (Y-m-d)
+ * @param string $startTime Start time (H:i)
+ * @param string $endTime End time (H:i)
  * @return int|bool Booking ID on success, false on failure
  */
-function createBooking($userId, $chargingPointId, $bookingDatetime) {
-    // Check if the charging point is available
-    if (!isChargingPointAvailable($chargingPointId, $bookingDatetime)) {
+function createBooking($userId, $chargingPointId, $date, $startTime, $endTime) {
+    try {
+        $conn = getDbConnection();
+        $conn->begin_transaction();
+
+        // Check if the charging point is available
+        if (!isTimeSlotAvailable($chargingPointId, $date, $startTime, $endTime)) {
+            throw new Exception('Selected time slot is not available.');
+        }
+
+        // Insert booking data
+        $stmt = $conn->prepare("
+            INSERT INTO Bookings (user_id, charging_point_id, booking_date, start_time, end_time, status)
+            VALUES (?, ?, ?, ?, ?, 'scheduled')
+        ");
+
+        $stmt->bind_param("iisss", $userId, $chargingPointId, $date, $startTime, $endTime);
+        
+        if (!$stmt->execute()) {
+            throw new Exception('Failed to create booking.');
+        }
+
+        $bookingId = $conn->insert_id;
+
+        // Update charging point status
+        $stmt = $conn->prepare("
+            UPDATE Charging_Points 
+            SET charging_point_state = 'reserved' 
+            WHERE charging_point_id = ?
+        ");
+
+        $stmt->bind_param("i", $chargingPointId);
+        
+        if (!$stmt->execute()) {
+            throw new Exception('Failed to update charging point status.');
+        }
+
+        $conn->commit();
+        return $bookingId;
+
+    } catch (Exception $e) {
+        if (isset($conn)) {
+            $conn->rollback();
+        }
+        error_log("Booking error: " . $e->getMessage());
+        return false;
+    }
+}
+
+/**
+ * Check if a time slot is available
+ *
+ * @param int $chargingPointId Charging point ID
+ * @param string $date Date (Y-m-d)
+ * @param string $startTime Start time (H:i)
+ * @param string $endTime End time (H:i)
+ * @return bool True if available, false if not
+ */
+function isTimeSlotAvailable($chargingPointId, $date, $startTime, $endTime) {
+    $conn = getDbConnection();
+    
+    // Check if charging point exists and is operational
+    $stmt = $conn->prepare("
+        SELECT charging_point_state 
+        FROM Charging_Points 
+        WHERE charging_point_id = ?
+    ");
+    
+    $stmt->bind_param("i", $chargingPointId);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    
+    if (!$result || !($point = $result->fetch_assoc())) {
         return false;
     }
 
-    // Insert booking data
-    $bookingData = [
-        'user_id' => $userId,
-        'charging_point_id' => $chargingPointId,
-        'booking_datetime' => $bookingDatetime
-    ];
-
-    $bookingId = insert('Bookings', $bookingData);
-
-    if ($bookingId) {
-        // Update charging point status
-        update('Charging_Points',
-            ['charging_point_state' => 'reserved'],
-            'charging_point_id = ?',
-            [$chargingPointId]
-        );
-
-        return $bookingId;
+    if ($point['charging_point_state'] === 'maintenance') {
+        return false;
     }
 
-    return false;
+    // Check for overlapping bookings
+    $stmt = $conn->prepare("
+        SELECT COUNT(*) as count 
+        FROM Bookings 
+        WHERE charging_point_id = ? 
+        AND booking_date = ?
+        AND status IN ('scheduled', 'active')
+        AND (
+            (start_time <= ? AND end_time > ?) OR
+            (start_time < ? AND end_time >= ?) OR
+            (start_time >= ? AND end_time <= ?)
+        )
+    ");
+
+    $stmt->bind_param("isssssss", 
+        $chargingPointId, 
+        $date, 
+        $startTime, $startTime,
+        $endTime, $endTime,
+        $startTime, $endTime
+    );
+
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $row = $result->fetch_assoc();
+
+    return $row['count'] == 0;
+}
+
+/**
+ * Get available time slots for a charging point
+ *
+ * @param int $chargingPointId Charging point ID
+ * @param string $date Date (Y-m-d)
+ * @return array Array of available time slots
+ */
+function getAvailableTimeSlots($chargingPointId, $date) {
+    $timeSlots = [];
+    $startHour = 6; // 6 AM
+    $endHour = 22; // 10 PM
+    $interval = 60; // 60 minutes per slot
+
+    for ($hour = $startHour; $hour < $endHour; $hour++) {
+        $startTime = sprintf("%02d:00", $hour);
+        $endTime = sprintf("%02d:00", $hour + 1);
+
+        if (isTimeSlotAvailable($chargingPointId, $date, $startTime, $endTime)) {
+            $timeSlots[] = [
+                'start' => $startTime,
+                'end' => $endTime
+            ];
+        }
+    }
+
+    return $timeSlots;
 }
 
 /**
@@ -48,142 +158,86 @@ function createBooking($userId, $chargingPointId, $bookingDatetime) {
  * @return bool True on success, false on failure
  */
 function cancelBooking($bookingId, $userId) {
-    // Verify that the booking belongs to the user
-    $booking = fetchOne(
-        "SELECT * FROM Bookings WHERE booking_id = ? AND user_id = ?",
-        [$bookingId, $userId]
-    );
+    try {
+        $conn = getDbConnection();
+        $conn->begin_transaction();
 
-    if (!$booking) {
+        // Get booking details
+        $stmt = $conn->prepare("
+            SELECT charging_point_id 
+            FROM Bookings 
+            WHERE booking_id = ? AND user_id = ? AND status = 'scheduled'
+        ");
+        
+        $stmt->bind_param("ii", $bookingId, $userId);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        
+        if (!$result || !($booking = $result->fetch_assoc())) {
+            throw new Exception('Booking not found or cannot be cancelled.');
+        }
+
+        // Update booking status
+        $stmt = $conn->prepare("
+            UPDATE Bookings 
+            SET status = 'cancelled' 
+            WHERE booking_id = ?
+        ");
+        
+        $stmt->bind_param("i", $bookingId);
+        
+        if (!$stmt->execute()) {
+            throw new Exception('Failed to cancel booking.');
+        }
+
+        // Update charging point status
+        $stmt = $conn->prepare("
+            UPDATE Charging_Points 
+            SET charging_point_state = 'available' 
+            WHERE charging_point_id = ?
+        ");
+        
+        $stmt->bind_param("i", $booking['charging_point_id']);
+        
+        if (!$stmt->execute()) {
+            throw new Exception('Failed to update charging point status.');
+        }
+
+        $conn->commit();
+        return true;
+
+    } catch (Exception $e) {
+        if (isset($conn)) {
+            $conn->rollback();
+        }
+        error_log("Cancel booking error: " . $e->getMessage());
         return false;
     }
-
-    // Delete the booking
-    $deleted = delete('Bookings', 'booking_id = ?', [$bookingId]);
-
-    if ($deleted) {
-        // Update charging point status back to available
-        update('Charging_Points',
-            ['charging_point_state' => 'available'],
-            'charging_point_id = ?',
-            [$booking['charging_point_id']]
-        );
-
-        return true;
-    }
-
-    return false;
 }
 
 /**
- * Get booking details
- *
- * @param int $bookingId Booking ID
- * @return array|null Booking details or null if not found
- */
-function getBookingDetails($bookingId) {
-    $sql = "SELECT b.*, cp.charging_point_state, cp.slots_num,
-                  s.address_street, s.address_city, s.address_municipality,
-                  u.name as user_name, u.email as user_email
-            FROM Bookings b
-            JOIN Charging_Points cp ON b.charging_point_id = cp.charging_point_id
-            JOIN Stations s ON cp.station_id = s.station_id
-            JOIN Users u ON b.user_id = u.user_id
-            WHERE b.booking_id = ?";
-
-    return fetchOne($sql, [$bookingId]);
-}
-
-/**
- * Get current and upcoming bookings for a user
+ * Get user's upcoming bookings
  *
  * @param int $userId User ID
- * @return array Array of current and upcoming bookings
+ * @return array Array of upcoming bookings
  */
-function getUserUpcomingBookings($userId) {
-    $currentDatetime = date('Y-m-d H:i:s');
+function getUpcomingBookings($userId) {
+    $conn = getDbConnection();
+    
+    $sql = "
+        SELECT b.*, cp.charging_point_state, s.address_street, s.address_city
+        FROM Bookings b
+        JOIN Charging_Points cp ON b.charging_point_id = cp.charging_point_id
+        JOIN Stations s ON cp.station_id = s.station_id
+        WHERE b.user_id = ? 
+        AND b.booking_date >= CURDATE()
+        AND b.status = 'scheduled'
+        ORDER BY b.booking_date, b.start_time
+    ";
 
-    $sql = "SELECT b.*, cp.charging_point_state, cp.slots_num,
-                  s.address_street, s.address_city
-            FROM Bookings b
-            JOIN Charging_Points cp ON b.charging_point_id = cp.charging_point_id
-            JOIN Stations s ON cp.station_id = s.station_id
-            WHERE b.user_id = ? 
-            AND b.booking_datetime >= ?
-            ORDER BY b.booking_datetime";
-
-    return fetchAll($sql, [$userId, $currentDatetime]);
-}
-
-/**
- * Check if a charging point is available for booking
- *
- * @param int $chargingPointId Charging point ID
- * @param string $bookingDatetime Booking datetime
- * @return bool True if available, false if not
- */
-function isChargingPointAvailable($chargingPointId, $bookingDatetime) {
-    // Check charging point status
-    $point = fetchOne(
-        "SELECT charging_point_state FROM Charging_Points WHERE charging_point_id = ?",
-        [$chargingPointId]
-    );
-
-    if (!$point || $point['charging_point_state'] !== 'available') {
-        return false;
-    }
-
-    // Check for existing bookings
-    $sql = "SELECT COUNT(*) as count FROM Bookings 
-            WHERE charging_point_id = ? 
-            AND booking_datetime = ?";
-
-    $result = fetchOne($sql, [$chargingPointId, $bookingDatetime]);
-
-    return $result['count'] == 0;
-}
-
-/**
- * Start a charging session
- *
- * @param int $bookingId Booking ID
- * @return int|bool Charging log ID on success, false on failure
- */
-function startChargingSession($bookingId) {
-    // Get booking details
-    $booking = getBookingDetails($bookingId);
-
-    if (!$booking) {
-        return false;
-    }
-
-    // Create charging log
-    $logData = [
-        'booking_id' => $bookingId,
-        'user_id' => $booking['user_id'],
-        'charging_point_id' => $booking['charging_point_id'],
-        'start_time' => date('Y-m-d H:i:s'),
-        'status' => 'in_progress'
-    ];
-
-    return insert('Charging_Logs', $logData);
-}
-
-/**
- * End a charging session
- *
- * @param int $logsId Charging log ID
- * @param float $energyConsumed Energy consumed in kWh
- * @param float $cost Total cost
- * @return bool True on success, false on failure
- */
-function endChargingSession($logsId, $energyConsumed, $cost) {
-    // Update charging log
-    $logData = [
-        'end_time' => date('Y-m-d H:i:s'),
-        'energy_consumed' => $energyConsumed,
-        'cost' => $cost
-    ];
-
-    return update('Charging_Logs', $logData, 'logs_id = ?', [$logsId]);
+    $stmt = $conn->prepare($sql);
+    $stmt->bind_param("i", $userId);
+    $stmt->execute();
+    
+    return $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
 }
